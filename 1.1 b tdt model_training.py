@@ -14,7 +14,8 @@
     speed_prob=0.5,
     pitch_prob=0.5,
 )
-# thts_it_ val_wer-
+# thts_it_ val_wer-for epoch-2  14.08 per
+# 
 
 from __future__ import annotations
 
