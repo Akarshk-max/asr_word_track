@@ -14,7 +14,8 @@
     speed_prob=0.5,
     pitch_prob=0.5,
 )
-# thts it for this model-
+# thts it for this model-epoch-2 14.58 per
+#  for epoch 3
 
 from __future__ import annotations
 
