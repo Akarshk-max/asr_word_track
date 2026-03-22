@@ -15,7 +15,7 @@
     pitch_prob=0.5,
 )
 # thts_it_ val_wer-for epoch-2  14.08 per
-# 
+# after 4 epochs --13.95
 
 from __future__ import annotations
 
