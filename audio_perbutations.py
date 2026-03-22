@@ -1,7 +1,7 @@
 # ═══════════════════════════════════════════════════════════════════════
 # 🎛️  INTERACTIVE AUDIO TRANSFORM PLAYGROUND (torchaudio)
 # ═══════════════════════════════════════════════════════════════════════
-
+#  this one worked closer enough wer with the raw model for 200 samples ,, but its slow for 200,000 samples withiin 2 hours ..
 # ──── KNOBS (tweak these!) ────
 PITCH_SEMITONES = -6      # negative = lower pitch  (try: -2, -4, -6)
 SPEED_FACTOR    = 1.08      # >1 = faster speech      (try: 1.0, 1.05, 1.10, 1.15)
