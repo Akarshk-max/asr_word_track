@@ -1,3 +1,14 @@
+# ran for 7 epochs so 
+# val-WER for epoch -4---WER:  0.1472 (14.72%)
+# CER:  0.0969 (9.69%)
+# epoch 6 -WER:  0.1475 (14.75%)
+# CER:  0.0970 (9.70%)
+# Exact match: 7,447/17,794 (41.9%)
+
+# final model-WER:  0.1476 (14.76%)
+CER:  0.0971 (9.71%)
+Exact match: 7,452/17,794 (41.9%)
+
 import os
 import subprocess
 import sys
