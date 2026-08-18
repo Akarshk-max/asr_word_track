@@ -1,0 +1,124 @@
+% Gradient flow for train_nemo_adapter_parakeet_vnext.py
+% Compile: pdflatex (needs amsmath, amssymb, hyperref optional)
+\documentclass[11pt]{article}
+\usepackage{amsmath,amssymb,bm}
+\usepackage[margin=1in]{geometry}
+
+\title{Backpropagation and gradient flow\\Parakeet-TDT vNext adapters (\texttt{train\_nemo\_adapter\_parakeet\_vnext.py})}
+\author{}
+\date{}
+
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\gelu}{\operatorname{GELU}}
+\newcommand{\LN}{\operatorname{LN}}
+
+\begin{document}
+\maketitle
+
+\section{Scope and notation}
+
+The training script attaches \textbf{custom adapters} after selected Fast-Conformer encoder blocks, injects \textbf{LoRA} into attention and FFN linears on layers $0,\ldots,L_{\text{lora}}-1$ (default $L_{\text{lora}}=5$), trains \textbf{joint} and \textbf{decoder}, and uses a shared Python object \texttt{AdapterStreamState} to pass tensors between adapter forwards \emph{without} \texttt{.detach()}. We index encoder depth by $\ell=0,\ldots,L-1$ (e.g.\ $L=42$). Adapter types split at $\ell_{\mathrm{early}}=8$: layers $\ell<8$ use a \textbf{two-bottleneck} adapter; $\ell\ge 8$ use a \textbf{single-bottleneck} adapter. The \textbf{bottleneck chain} is continuous: only layer $\ell=0$ omits $\texttt{chain\_proj}$; for $\ell\ge 1$, the previous layer's \textbf{post-LayerNorm} $256$-d tensor $\bm{b}^{(\ell-1)}$ is injected \textbf{before} GELU at layer $\ell$.
+
+Let $d=1024$, $r=256$, $m$ = \texttt{MEMORY\_DIM} (default $128$). Frame axis has length $T$ (may differ by layer due to subsampling; the code may resize $\bm{z}_{\mathrm{prev}}$ with nearest-neighbor interpolation in time).
+
+\section{NeMo residual and loss}
+
+Each adapter module returns a \textbf{delta} $\Delta\bm{x}^{(\ell)} \in \R^{B\times T\times d}$; NeMo's residual strategy forms
+\begin{equation}
+  \tilde{\bm{x}}^{(\ell)} = \bm{x}^{(\ell)} + \Delta\bm{x}^{(\ell)}.
+\end{equation}
+Gradients satisfy (schematically)
+\begin{equation}
+  \frac{\partial \mathcal{L}}{\partial \bm{x}^{(\ell)}}
+  = \frac{\partial \mathcal{L}}{\partial \tilde{\bm{x}}^{(\ell)}},
+  \qquad
+  \frac{\partial \mathcal{L}}{\partial \Delta\bm{x}^{(\ell)}}
+  = \frac{\partial \mathcal{L}}{\partial \tilde{\bm{x}}^{(\ell)}}.
+\end{equation}
+Thus loss signals reach both the frozen trunk output $\bm{x}^{(\ell)}$ and the adapter path; frozen weights do not update ($\texttt{requires\_grad}=\texttt{False}$), but \textbf{gradients still flow into $\bm{x}^{(\ell)}$} as usual for backprop through the encoder graph (stopped at frozen parameters).
+
+The TDT/RNNT loss $\mathcal{L}$ couples encoder outputs, the trainable \textbf{joint}, and \textbf{decoder}; its gradients reach every trainable module on those paths.
+
+\section{Early adapter ($0\le \ell < 8$)}
+
+\subsection{Forward}
+Let $\bm{x}=\bm{x}^{(\ell)} \in \R^{B\times T\times d}$. Define
+\begin{align}
+  \bm{h}_1 &= \bm{x}\bm{W}_1^\top + \bm{b}_1 \in \R^{B\times T\times r}, \\
+  \bm{h}_{2,\mathrm{pre}} &= \bm{h}_1 \bm{W}_2^\top + \bm{b}_2 \in \R^{B\times T\times r}.
+\end{align}
+For $\ell\ge 1$, let $\bm{b}_{\mathrm{prev}} \equiv \bm{b}^{(\ell-1)}$ be \texttt{prev\_bottleneck} (post-LayerNorm from layer $\ell-1$). Then
+\begin{equation}
+  \bm{h}_{2,\mathrm{pre}} \leftarrow \bm{h}_{2,\mathrm{pre}} + \bm{b}_{\mathrm{prev}} \bm{W}_{\mathrm{chain}}^{(\ell)\top}
+  \quad\text{(\texttt{h2\_pre + chain\_proj(prev\_b)}).}
+\end{equation}
+Nonlinearity and bottleneck norm:
+\begin{equation}
+  \tilde{\bm{z}}^{(\ell)} = \gelu\!\bigl(\bm{h}_{2,\mathrm{pre}}\bigr), \qquad
+  \bm{b}^{(\ell)} = \LN\bigl(\tilde{\bm{z}}^{(\ell)}\bigr).
+\end{equation}
+LSTM-style memory (on $\bm{b}^{(\ell)}$) and a \textbf{weighted} fusion of memory output and up-projection (defaults $\lambda_m=0.7$, $\lambda_u=0.3$):
+\begin{align}
+  (\bm{m}^{(\ell)}, \bm{h}_{\mathrm{mem}}^{(\ell)}, \bm{c}_{\mathrm{mem}}^{(\ell)}) &= \text{\texttt{AdapterMemoryCell}}\bigl(\bm{b}^{(\ell)}, \bm{h}_{\mathrm{mem}}^{(\ell-1)}, \bm{c}_{\mathrm{mem}}^{(\ell-1)}\bigr), \\
+  \bm{u}^{(\ell)} &= \lambda_m\, \bm{m}^{(\ell)} + \lambda_u \bigl(\bm{b}^{(\ell)}\bm{W}_{\mathrm{up}}^\top + \bm{b}_{\mathrm{up}}\bigr), \\
+  \Delta\bm{x}^{(\ell)} &= \text{Dropout}\bigl(\LN(\bm{u}^{(\ell)})\bigr).
+\end{align}
+The stream state stores $\bm{b}^{(\ell)}$ for the next layer: \texttt{update\_after\_adapter}$(\bm{b}^{(\ell)}, \bm{h}_{\mathrm{mem}}^{(\ell)}, \bm{c}_{\mathrm{mem}}^{(\ell)})$.
+
+\subsection{Backward highlights}
+\paragraph{GELU.}
+With $\bm{z} = \gelu(\bm{h})$, backprop supplies $\bar{\bm{h}} = \bar{\bm{z}} \odot \sigma'_{\gelu}(\bm{h})$ (elementwise), where $\sigma'_{\gelu}$ is the GELU derivative.
+
+\paragraph{Chain injection (no detach).}
+The addition $\bm{h}_{2,\mathrm{pre}} = \bm{h}_{2,\mathrm{pre}}^{\mathrm{local}} + \bm{W}_{\mathrm{chain}}\bm{z}_{\mathrm{prev}}$ (using $\bm{y}\bm{W}^\top \equiv \bm{W}\bm{y}$ in row-vector convention---match your code's layout) implies
+\begin{equation}
+  \frac{\partial \mathcal{L}}{\partial \bm{z}_{\mathrm{prev}}}
+  \text{ receives a term from }
+  \frac{\partial \mathcal{L}}{\partial \bm{h}_{2,\mathrm{pre}}}
+  \text{ through } \bm{W}_{\mathrm{chain}}^{(\ell)}.
+\end{equation}
+Because $\bm{b}_{\mathrm{prev}} \equiv \bm{b}^{(\ell-1)}$ is the \textbf{same tensor} produced in the previous forward (not detached), autograd connects layer $\ell$ to all computations that produced $\bm{b}^{(\ell-1)}$: $\LN$, $\gelu$, $\bm{W}_2^{(\ell-1)}$, $\bm{W}_1^{(\ell-1)}$, optional chain at $\ell-1$, and deeper history. Hence \textbf{gradients traverse the full depth chain} through the bottleneck sequence.
+
+\paragraph{Time resize.}
+If \texttt{\_match\_seq\_len} applies 1D nearest-neighbor upsampling/downsampling along $T$, gradients scatter/gather to the corresponding time indices (standard \texttt{interpolate} backward).
+
+\paragraph{Memory cell.}
+The cell is an LSTM-style recurrence \emph{across layers} (not across time steps within a single layer): $\bm{h}_{\mathrm{mem}}^{(\ell)}$ depends on $\bm{h}_{\mathrm{mem}}^{(\ell-1)}$ and $\bm{b}^{(\ell)}$. During backprop, gradients flow from $\bm{u}^{(\ell)}$ into both $\bm{m}^{(\ell)}$ (memory weights) and $\bm{b}^{(\ell)}$ (hence $\tilde{\bm{z}}^{(\ell)}$, down projections, and chain), with weights $\lambda_m$ and $\lambda_u$. Gradients also flow into the previous memory state, recursively to earlier layers' memory parameters (\texttt{gates}, \texttt{mem\_output\_proj}).
+
+\paragraph{Initialization of $\bm{W}_{\mathrm{up}}$.}
+Weights are drawn $\mathcal{N}(0, 0.002^2)$ with zero bias so the direct bottleneck$\to$output path has non-zero Jacobian at initialization (healthier early gradients than $\bm{W}_{\mathrm{up}}=\bm{0}$); magnitudes stay small.
+
+\section{Late adapter ($\ell \ge 8$)}
+
+Forward (same chain semantics for $\ell\ge 1$):
+\begin{align}
+  \bm{h}_{\mathrm{pre}} &= \bm{x}\bm{W}_{\mathrm{down}}^\top + \bm{b}_{\mathrm{down}}, \\
+  \bm{h}_{\mathrm{pre}} &\leftarrow \bm{h}_{\mathrm{pre}} + \bm{W}_{\mathrm{chain}}^{(\ell)}\bm{b}_{\mathrm{prev}}
+  \quad (\ell\ge 1), \\
+  \tilde{\bm{z}}^{(\ell)} &= \gelu(\bm{h}_{\mathrm{pre}}), \qquad
+  \bm{b}^{(\ell)} = \LN(\tilde{\bm{z}}^{(\ell)}),
+\end{align}
+then the same memory and $\lambda_m\bm{m}+\lambda_u\bm{W}_{\mathrm{up}}\bm{b}$ fusion, out-$\LN$, dropout; stream stores $\bm{b}^{(\ell)}$. \textbf{Gradient structure matches} the early block.
+
+\section{Cross-layer computational graph (conceptual)}
+
+Order adapters by increasing encoder index. The graph is \textbf{not} a tree: $\bm{b}^{(\ell-1)}$ is a shared node consumed by layer $\ell$'s chain branch and is also an ancestor of all later layers that (transitively) depend on it. Backprop implements the \textbf{multivariate chain rule}: the gradient w.r.t.\ $\bm{b}^{(\ell-1)}$ is the sum of contributions from (i) the usual path through the encoder trunk into layer $\ell$'s down projections and (ii) the explicit chain path into $\bm{h}_{2,\mathrm{pre}}$ or $\bm{h}_{\mathrm{pre}}$ at layer $\ell$, and (iii) any later layers that routed gradients back through memory or through deeper adapters that ultimately depend on $\bm{b}^{(\ell-1)}$.
+
+\section{LoRA on encoder layers $0,\ldots,4$}
+
+For a wrapped linear with frozen $\bm{W},\bm{b}$ and rank-$r_{\mathrm{lora}}$ matrices $\bm{A}\in\R^{r_{\mathrm{lora}}\times d_{\mathrm{in}}}$, $\bm{B}\in\R^{d_{\mathrm{out}}\times r_{\mathrm{lora}}}$,
+\begin{equation}
+  \bm{y} = \bm{x}\bm{W}^\top + \bm{b} + s \cdot \operatorname{Dropout}(\bm{x}) \bm{A}^\top \bm{B}^\top,
+  \qquad s = \alpha / r_{\mathrm{lora}}.
+\end{equation}
+Then $\partial \mathcal{L}/\partial \bm{W}=\bm{0}$ (frozen), while $\partial \mathcal{L}/\partial \bm{A}$ and $\partial \mathcal{L}/\partial \bm{B}$ are non-zero and update only LoRA parameters. Gradients from adapters and the chain still reach $\bm{x}$ and thus LoRA branches inside early encoder blocks.
+
+\section{Stream reset and minibatches}
+
+\texttt{AdapterStreamState.reset()} at each full model forward clears Python references; \textbf{no tensor is carried across minibatches}. Within one forward, the graph is well-defined; \texttt{backward()} traverses it once per step.
+
+\section{Optimizer viewpoint (five groups)}
+
+The implementation uses separate AdamW parameter groups (LoRA, adapter weights excluding memory, memory cell, joint, decoder) with a shared step-wise LR schedule. This does \textbf{not} change the gradient definitions; it scales each group's update magnitude.
+
+\end{document}

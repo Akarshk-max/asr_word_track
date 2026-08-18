@@ -1,0 +1,198 @@
+% Methodology: Parakeet-TDT child-speech adaptation (vNext)
+% Source of truth: train_nemo_adapter_parakeet_vnext.py
+% Compile: pdflatex parakeet_vnext_methodology.tex
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{microtype}
+
+\title{Child-Speech Adaptation of Parakeet-TDT\\Parameter-Efficient vNext Adapters, LoRA, and Augmentation}
+\author{}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We summarize the problem setting, model architecture, data scale, front-end augmentations, and optimization hyperparameters used for adapting the pretrained \texttt{nvidia/parakeet-tdt-1.1b} Transducer ASR model to child speech. Training is implemented in \texttt{train\_nemo\_adapter\_parakeet\_vnext.py} (NeMo + PyTorch Lightning). The training corpus comprises approximately \textbf{280 hours} of labeled speech. The run uses \textbf{full} manifest training (no debug subsampling), a \textbf{noise curriculum} over epochs, extended \textbf{LoRA} on many encoder layers including pointwise convolutions, and a phased freeze schedule aligned with co-adaptation of adapters and low-rank weights.
+\end{abstract}
+
+% ---------------------------------------------------------------------------
+\section{Problem and objective}
+\label{sec:problem}
+
+\paragraph{Setting.}
+Automatic speech recognition (ASR) models such as Parakeet-TDT are typically trained predominantly on adult speech. Child speech differs systematically in pitch range, articulation, tempo, and recording conditions, which increases word error rate when a general-domain model is applied without adaptation.
+
+\paragraph{Objective.}
+We perform \textbf{supervised fine-tuning} on child-speech transcripts while keeping the bulk of the pretrained Fast-Conformer encoder frozen. Trainable components are limited to:
+\begin{itemize}
+  \item Low-rank adapters (LoRA) on selected encoder layers and submodule paths (including pointwise \texttt{Conv1d}),
+  \item Custom encoder adapters with a shared bottleneck chain and LSTM-style memory,
+  \item The Transducer \textbf{joint} network and \textbf{decoder} (with a phased freeze schedule over epochs).
+\end{itemize}
+This yields a parameter-efficient adaptation that targets domain shift without full-model fine-tuning.
+
+\paragraph{Data.}
+Training uses approximately \textbf{280 hours} of labeled child-speech audio (manifest-driven; clips filtered by duration in code, see \S\ref{sec:hyper}). Labels are normalized with the Whisper English text normalizer when available, otherwise lowercased. The training script uses the \textbf{full} manifest by default (debug subsampling has been removed).
+
+% ---------------------------------------------------------------------------
+\section{Base model and training stack}
+\label{sec:base}
+
+\paragraph{Backbone.}
+Base checkpoint: \textbf{Parakeet-TDT-1.1B} (\texttt{MODEL\_ID = nvidia/parakeet-tdt-1.1b}), a NeMo \texttt{ASRModel} with Transducer (RNNT/TDT) loss, trained encoder, and trainable joint/decoder in our schedule.
+
+\paragraph{Framework.}
+PyTorch Lightning trainer: single GPU when available (\texttt{bf16-mixed} precision), \texttt{gradient\_clip\_val = 1.0}, no validation loop during this run (\texttt{limit\_val\_batches = 0}). Optimizer is \textbf{AdamW} with \textbf{per-group} learning rates and a step-wise \textbf{linear warmup + cosine} schedule (warmup ratio $0.15$ on total optimizer steps), implemented in the training script (overriding the generic NeMo config block for the multi-group setup).
+
+% ---------------------------------------------------------------------------
+\section{Architecture (vNext adapters and LoRA)}
+\label{sec:arch}
+
+\subsection{Encoder adapters: two regimes}
+Encoder layers are indexed $\ell = 0,\ldots,L-1$ (e.g.\ $L=42$ for this backbone). Adapters are attached via NeMo's adapter mixin on the encoder; the default \texttt{LinearAdapter} modules are \textbf{replaced} at runtime by custom modules.
+
+\paragraph{Early layers ($\ell \in \{0,\ldots,7\}$): two-bottleneck adapter.}
+Hidden dimension $d=1024$. The adapter maps $1024 \rightarrow 256 \rightarrow 256$ (\texttt{EarlyTwoBottleneckAdapter}), with GELU and LayerNorm on the bottleneck, dropout $0.1$, and output LayerNorm back to $d$ before the residual delta is added by NeMo's adapter strategy.
+
+\paragraph{Late layers ($\ell \geq 8$): single-bottleneck adapter.}
+Maps $1024 \rightarrow 256$ (\texttt{LateChainedAdapter}), then the same GELU / bottleneck LayerNorm / memory / up-projection pattern with dropout $0.1$.
+
+\subsection{Continuous bottleneck chain}
+Layer $\ell=0$ has no incoming chain. For $\ell \geq 1$, the \textbf{post-LayerNorm} bottleneck tensor from layer $\ell-1$ is projected with a learned linear \texttt{chain\_proj} (no bias, orthogonal init scaled by $0.9$) and \textbf{added} to the pre-GELU bottleneck activations at layer $\ell$. The chain is \textbf{continuous} across the early/late boundary (layer $7 \rightarrow 8 \rightarrow \cdots$) with no architectural break.
+
+Chain tensors are \textbf{not} detached from the computation graph, so backpropagation can flow through the full depth of the bottleneck sequence (see also \texttt{parakeet\_vnext\_gradient\_flow.tex}).
+
+\subsection{LSTM-style memory}
+Each adapter includes an \texttt{AdapterMemoryCell}: a gated cell operating on the post-LayerNorm bottleneck (dimension $256$) with hidden/cell state dimension \texttt{MEMORY\_DIM} (default $128$). States are carried across encoder layers within a single forward pass via a shared \texttt{AdapterStreamState} object; states are \textbf{reset at the start of each full forward} (utterance-level), not carried across batches.
+
+The residual delta is a \textbf{convex fusion} of memory output and the bottleneck up-projection:
+\[
+\bm{u} = \lambda_m \, \bm{m}_{\mathrm{mem}} + \lambda_u \, \mathrm{Up}(\bm{b}),
+\qquad
+\lambda_m = 0.7,\;\; \lambda_u = 0.3
+\]
+(defaults \texttt{LSTM\_OUT\_FUSE\_WEIGHT}, \texttt{ADAPTER\_UP\_FUSE\_WEIGHT}), followed by output LayerNorm and dropout.
+
+\subsection{LoRA on the frozen encoder}
+Low-rank adaptation is applied only on encoder layers whose indices lie in a configurable set; the default is \textbf{twenty-one layers} $\ell \in \{0,\ldots,20\}$. Layer membership can be overridden with the environment variable \texttt{LORA\_LAYERS} as a comma-separated list of indices (a single integer denotes that layer only, not a count).
+
+\paragraph{Target modules (path substring matching).}
+For each layer, submodules whose \texttt{named\_modules()} paths match \textbf{all} dot-separated fragments of a target string (case-insensitive) receive LoRA:
+\begin{itemize}
+  \item \textbf{Linear:} attention projections (\texttt{self\_attn.q\_proj}, \texttt{k\_proj}, \texttt{v\_proj}, \texttt{o\_proj} and NeMo-style \texttt{linear\_q}, \texttt{linear\_k}, \texttt{linear\_v}, \texttt{linear\_out}), FFN blocks (\texttt{ffn1.linear1/2}, \texttt{ffn2.linear1/2}, \texttt{feed\_forward.linear1/2}). Adapter-internal linears are excluded by an \texttt{adapter} path filter.
+  \item \textbf{Pointwise \texttt{Conv1d} ($k{=}1$, \texttt{groups}${=}1$):} \texttt{conv\_module.pointwise\_conv1} and \texttt{conv\_module.pointwise\_conv2}. This is equivalent to a linear map across channels at each time step; \textbf{depthwise} convolutions are not modified.
+\end{itemize}
+Wrappers: \texttt{LinearWithLoRA} for \texttt{nn.Linear}, \texttt{Conv1dPointwiseLoRA} for eligible \texttt{nn.Conv1d}. Default rank and scaling are \texttt{LORA\_R = 16}, \texttt{LORA\_ALPHA = 32}, dropout \texttt{0.05}. Base weights stay frozen; only LoRA factors train when that stage is unfrozen.
+
+\subsection{Joint and decoder}
+The Transducer \textbf{joint} and \textbf{decoder} (including prediction network) are unfrozen for training subject to the phased schedule in \S\ref{sec:phased}.
+
+% ---------------------------------------------------------------------------
+\section{Augmentations}
+\label{sec:aug}
+
+\subsection{Time-domain (waveform) --- custom \texttt{WaveformAugmentor}}
+Applied inside a wrapped model \texttt{forward} when \texttt{training=True}, before the standard encoder front-end.
+
+\begin{itemize}
+  \item \textbf{Time-stretch (speed):} with probability $0.5$, factor uniform in $[0.85,\,1.15]$; lengths scaled accordingly.
+  \item \textbf{Pitch shift:} with probability $0.5$, semitone shift uniform in $[-2,\,2]$ via \texttt{torchaudio.functional.pitch\_shift} at $16$\,kHz (errors ignored).
+  \item \textbf{Additive noise (curriculum):} when \texttt{NOISE\_CURRICULUM} is enabled (default), \texttt{NoiseCurriculumCallback} updates mix probability and SNR range at each epoch (human epoch index $1,2,\ldots$):
+  \begin{center}
+  \begin{tabular}{@{}lccc@{}}
+    \toprule
+    Human epochs & Mix prob.\ & SNR range (dB) \\
+    \midrule
+    $1$--$3$ & $0.3$ & $[5,\,20]$ \\
+    $4$--$5$ & $0.4$ & $[5,\,15]$ \\
+    $6$ and later & $0.5$ & $[3,\,10]$ \\
+    \bottomrule
+  \end{tabular}
+  \end{center}
+  A random segment from an indexed noise corpus (resampled to $16$\,kHz) is mixed \textbf{per utterance}. If \texttt{NOISE\_CURRICULUM=0}, fixed defaults \texttt{NOISE\_AUG\_PROB}, \texttt{NOISE\_SNR\_MIN}, \texttt{NOISE\_SNR\_MAX} apply.
+  \item \textbf{Random gain:} with probability $0.3$, multiply waveform by gain uniform in $[-8,\,8]$\,dB.
+\end{itemize}
+
+\subsection{Time-frequency (spectrogram) --- NeMo \texttt{SpectrogramAugmentation}}
+Configured in the model config and applied in the NeMo pipeline:
+\begin{itemize}
+  \item \textbf{Frequency masking:} 2 masks, width 27 bins.
+  \item \textbf{Time masking:} 10 masks, width fraction $0.05$ of the time axis.
+\end{itemize}
+
+% ---------------------------------------------------------------------------
+\section{Phased training and checkpoints}
+\label{sec:phased}
+
+Training runs for \textbf{7 epochs} by default. \texttt{requires\_grad} is toggled at the start of each epoch. Using \textbf{human} epoch labels ($h = \texttt{current\_epoch} + 1$) and Lightning's \textbf{0-based} last-training-epoch indices \texttt{PHASE\_*\_LAST\_EPOCH}:
+
+\begin{itemize}
+  \item \textbf{LoRA} trains while $\texttt{current\_epoch} \leq \texttt{PHASE\_LORA\_LAST\_EPOCH}$ (default \texttt{5}), i.e.\ human epochs $1$--$6$. This extends low-rank training relative to early freezing so adapters (which train all seven epochs) co-adapt with more mature LoRA features.
+  \item \textbf{Joint} trains through human epochs $1$--$3$ (\texttt{PHASE\_JOINT\_LAST\_EPOCH = 2}).
+  \item \textbf{Decoder} trains through human epochs $1$--$4$ (\texttt{PHASE\_DECODER\_LAST\_EPOCH = 3}).
+  \item \textbf{Adapter modules} (including chain and \texttt{memory\_cell}) train through all $7$ epochs (\texttt{PHASE\_ADAPTER\_MEMORY\_LAST\_EPOCH = 6}).
+\end{itemize}
+
+Full checkpoints (\texttt{.nemo} via \texttt{save\_to}) and adapter bundles (\texttt{save\_adapters}) are written only after \textbf{human epochs} 5, 6, and 7 (no other scheduled checkpoints). No separate \texttt{model\_final} write after \texttt{fit} --- only those three timed saves.
+
+% ---------------------------------------------------------------------------
+\section{Hyperparameters}
+\label{sec:hyper}
+
+Table~\ref{tab:hyp} lists principal defaults from the training script (overridable via environment variables where indicated).
+
+\begin{table}[htbp]
+  \centering
+  \caption{Default hyperparameters (\texttt{train\_nemo\_adapter\_parakeet\_vnext.py}).}
+  \label{tab:hyp}
+  \begin{tabular}{@{}ll@{}}
+    \toprule
+    Quantity & Value \\
+    \midrule
+    Training audio hours (approx.) & \textbf{280} \\
+    Max utterance duration & $20$\,s \\
+    Batch size & $32$ \\
+    DataLoader workers & $2$ \\
+    Epochs & $7$ \\
+    Early adapter layers (two-bottleneck) & $\ell < 8$ \\
+    Late adapter layers (single-bottleneck) & $\ell \geq 8$ \\
+    Bottleneck dim.\ (early / late) & $256$ / $256$ \\
+    Memory dim.\ (\texttt{MEMORY\_DIM}) & $128$ \\
+    LoRA layer indices (default) & $\{0,\ldots,20\}$ (21 layers) \\
+    LoRA $r$ / $\alpha$ / dropout & $16$ / $32$ / $0.05$ \\
+    LoRA targets & Attention + FFN linears; \texttt{conv\_module.pointwise\_conv1/2} \\
+    \texttt{PHASE\_LORA\_LAST\_EPOCH} (0-based) & $5$ $\Rightarrow$ LoRA human ep.\ $1$--$6$ \\
+    \texttt{PHASE\_JOINT\_LAST\_EPOCH} & $2$ $\Rightarrow$ joint human ep.\ $1$--$3$ \\
+    \texttt{PHASE\_DECODER\_LAST\_EPOCH} & $3$ $\Rightarrow$ decoder human ep.\ $1$--$4$ \\
+    Adapter internal dropout & $0.1$ \\
+    AdamW $\beta$ & $(0.9, 0.999)$ \\
+    Weight decay & $0.01$ \\
+    LR LoRA & $3\times 10^{-4}$ \\
+    LR adapter (non-memory) & $5\times 10^{-4}$ \\
+    LR memory cell & $3\times 10^{-4}$ \\
+    LR joint & $1\times 10^{-4}$ \\
+    LR decoder & $5\times 10^{-5}$ \\
+    Warmup ratio (cosine schedule) & $0.15$ \\
+    Gradient clipping & $1.0$ \\
+    Mixed precision (GPU) & bfloat16 mixed \\
+    Noise curriculum & on (\texttt{NOISE\_CURRICULUM=1}); see \S\ref{sec:aug} \\
+    Checkpoint epochs (human) & $5$, $6$, $7$ only \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\paragraph{Steps per epoch.}
+With $N$ training rows and batch size $B$, steps per epoch $\approx \lceil N / B \rceil$ (printed at startup from the manifest).
+
+% ---------------------------------------------------------------------------
+\section{Related notes}
+
+Gradient flow through the chain and memory (including the effect of no \texttt{detach} on chain tensors) is documented in \texttt{parakeet\_vnext\_gradient\_flow.tex}. That note still uses an older ``five-layer LoRA'' description for illustration; the \textbf{numeric and structural source of truth} for the current run is this file and \texttt{train\_nemo\_adapter\_parakeet\_vnext.py}. For exact behavior (env overrides, manifest paths, NeMo submodule naming), refer to the Python source.
+
+\end{document}

@@ -1,0 +1,36 @@
+# ── Model weights / archives (GitHub file-size limits) ───────────────────────
+*.nemo
+*.ckpt
+*.pt
+*.pth
+*.tar.gz
+*.zip
+
+# ── Competition + derived data (not redistributable; see README) ─────────────
+*.jsonl
+*.csv
+*.flac
+*.wav
+eval_subset/
+combined_asr_dataset/
+submission_1_meta_data/
+kaggle_wheels/
+
+# ── Vendored upstream repos (see links in README) ────────────────────────────
+childrens-speech-recognition-benchmark-pub-main/
+childrens-speech-recognition-runtime-main/
+
+# ── Python ──────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# ── LaTeX build artifacts ───────────────────────────────────────────────────
+*.aux
+*.log
+*.out
+*.toc
+*.pdf
+
+.DS_Store
